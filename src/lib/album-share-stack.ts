@@ -34,22 +34,44 @@ export class AlbumShareStack extends Stack {
     });
 
     // Create the User Pool
-    const userPool = new cognito.UserPool(this, 'UserPool', {
-      selfSignUpEnabled: false,
+    const userPool = new cognito.UserPool(this, 'AlbumUserPool', {
+      selfSignUpEnabled: true,
       signInAliases: { email: true },
       autoVerify: { email: true },
-      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
-    });
-
-    // Create the User Pool Client
-    const userPoolClient = new cognito.UserPoolClient(this, 'UserPoolClient', {
-      userPool,
-      authFlows: {
-        userPassword: true,
-        adminUserPassword: true,
+      passwordPolicy: {
+        minLength: 8,
+        requireLowercase: true,
+        requireUppercase: false,
+        requireDigits: true,
+        requireSymbols: false,
       },
     });
 
+    // Create the User Pool Client
+    const userPoolClient = new cognito.UserPoolClient(this, 'AlbumUserPoolClient', {
+      userPool,
+      generateSecret: false,
+      authFlows: {
+        userPassword: true,
+        userSrp: true,
+      },
+      oAuth: {
+        flows: {
+          authorizationCodeGrant: true,
+        },
+        scopes: [
+          cognito.OAuthScope.OPENID,
+          cognito.OAuthScope.EMAIL,
+          cognito.OAuthScope.PROFILE,
+        ],
+        callbackUrls: [
+          'http://localhost:3000', // front-end dev
+        ],
+        logoutUrls: [
+          'http://localhost:3000',
+        ],
+      },
+    });
 
     // DynamoDB table for photo metadata
     const photoTable = new dynamodb.Table(this, 'PhotoTable', {
@@ -59,11 +81,22 @@ export class AlbumShareStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
     });
 
+    const domain = new cognito.UserPoolDomain(this, 'AlbumUserPoolDomain', {
+      userPool,
+      cognitoDomain: {
+        domainPrefix: 'albumshare-' + this.account, // must be globally unique
+      },
+    });
+
     // Outputs for frontend use
     new CfnOutput(this, 'WebUrl', { value: distribution.distributionDomainName });
     new CfnOutput(this, 'PhotoBucketName', { value: photoBucket.bucketName });
     new CfnOutput(this, 'UserPoolId', { value: userPool.userPoolId });
     new CfnOutput(this, 'UserPoolClientId', { value: userPoolClient.userPoolClientId });
     new CfnOutput(this, 'PhotoTableName', { value: photoTable.tableName });
+    new CfnOutput(this, 'CognitoLoginUrl', {
+      value: domain.baseUrl() + '/login?client_id=' + userPoolClient.userPoolClientId +
+        '&response_type=code&scope=email+openid+profile&redirect_uri=http://localhost:3000',
+    });
   }
 }
