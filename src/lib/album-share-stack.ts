@@ -104,9 +104,6 @@ export class AlbumShareStack extends Stack {
       principals: [reactUser],
     })
 
-    
-
-
   );
 
 
