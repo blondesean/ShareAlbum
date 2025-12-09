@@ -8,10 +8,16 @@ exports.handler = async (event) => {
     // Get user ID from Cognito authorizer
     const userId = event.requestContext.authorizer.claims.sub;
     
-    // Parse request body
-    const body = JSON.parse(event.body || '{}');
-    const photoKey = body.photoKey;
-    const tag = body.tag;
+    // For GET requests, use query parameters; for POST/DELETE, use body
+    let photoKey, tag;
+    
+    if (event.httpMethod === 'GET') {
+      photoKey = event.queryStringParameters?.photoKey;
+    } else {
+      const body = JSON.parse(event.body || '{}');
+      photoKey = body.photoKey;
+      tag = body.tag;
+    }
 
     if (!photoKey) {
       return {
