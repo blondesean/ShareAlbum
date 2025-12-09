@@ -33,6 +33,14 @@ export class AlbumShareStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
     });
 
+    // DynamoDB table for tags (photoKey + userId + tag)
+    const tagsTable = new dynamodb.Table(this, 'TagsTable', {
+      partitionKey: { name: 'photoKey', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'userIdTag', type: dynamodb.AttributeType.STRING }, // format: "userId#tagName"
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
     // Lambda function that lists photos and signed URLs
     const InventoryDescriber = new lambda.Function(this, 'InventoryDescriber', {
       functionName: "Album-Share-Inventory-Describer",
@@ -169,6 +177,21 @@ export class AlbumShareStack extends Stack {
         authorizationType: apigateway.AuthorizationType.COGNITO,
     });
 
+    // Lambda function for managing tags
+    const manageTagsFunction = new lambda.Function(this, 'ManageTagsFunction', {
+      functionName: "Album-Share-Manage-Tags",
+      description: "Add, remove, or list tags for photos",
+      runtime: lambda.Runtime.NODEJS_18_X,
+      handler: 'manage-tags.handler',
+      code: lambda.Code.fromAsset('lambda'),
+      environment: {
+        TABLE_NAME: tagsTable.tableName,
+      },
+    });
+
+    // Grant Lambda permission to read/write tags table
+    tagsTable.grantReadWriteData(manageTagsFunction);
+
     // Favorites endpoint - POST to add, DELETE to remove
     const favorites = api.root.addResource('favorites');
     favorites.addMethod('POST', new apigateway.LambdaIntegration(manageFavoritesFunction), {
@@ -176,6 +199,21 @@ export class AlbumShareStack extends Stack {
         authorizationType: apigateway.AuthorizationType.COGNITO,
     });
     favorites.addMethod('DELETE', new apigateway.LambdaIntegration(manageFavoritesFunction), {
+        authorizer: albumUserPoolAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+
+    // Tags endpoint - POST to add, DELETE to remove, GET to list
+    const tags = api.root.addResource('tags');
+    tags.addMethod('POST', new apigateway.LambdaIntegration(manageTagsFunction), {
+        authorizer: albumUserPoolAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    tags.addMethod('DELETE', new apigateway.LambdaIntegration(manageTagsFunction), {
+        authorizer: albumUserPoolAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    tags.addMethod('GET', new apigateway.LambdaIntegration(manageTagsFunction), {
         authorizer: albumUserPoolAuthorizer,
         authorizationType: apigateway.AuthorizationType.COGNITO,
     });
@@ -204,6 +242,11 @@ export class AlbumShareStack extends Stack {
     new CfnOutput(this, 'FavoritesTableName', {
       value: favoritesTable.tableName,
       description: 'DynamoDB table for favorites'
+    });
+
+    new CfnOutput(this, 'TagsTableName', {
+      value: tagsTable.tableName,
+      description: 'DynamoDB table for tags'
     });
 
     new CfnOutput(this, "ReactAlbumUserName", {
