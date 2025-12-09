@@ -5,13 +5,11 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as iam from "aws-cdk-lib/aws-iam";
-// import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
-// import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
-// import * as cognito from 'aws-cdk-lib/aws-cognito';
-// import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 
 export class AlbumShareStack extends Stack {
-  constructor(scope: Construct, id: string, props?: StackProps) {
+  constructor(scope: Construct, id: string, props?: StackProps) {7
     super(scope, id, props);
 
     // ========================================
@@ -27,6 +25,14 @@ export class AlbumShareStack extends Stack {
       enforceSSL: true,
     });
 
+    // DynamoDB table for favorites (userId + photoKey)
+    const favoritesTable = new dynamodb.Table(this, 'FavoritesTable', {
+      partitionKey: { name: 'userId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'photoKey', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
     // Lambda function that lists photos and signed URLs
     const InventoryDescriber = new lambda.Function(this, 'InventoryDescriber', {
       functionName: "Album-Share-Inventory-Describer",
@@ -36,11 +42,13 @@ export class AlbumShareStack extends Stack {
       code: lambda.Code.fromAsset('lambda'),
       environment: {
         BUCKET_NAME: photoBucket.bucketName,
+        FAVORITES_TABLE: favoritesTable.tableName,
       },
     });
 
-    // Grant Lambda permission to read from S3 bucket
+    // Grant Lambda permission to read from S3 bucket and favorites table
     photoBucket.grantRead(InventoryDescriber);
+    favoritesTable.grantReadData(InventoryDescriber);
 
     // API Gateway
     const api = new apigateway.RestApi(this, 'PhotoApiAS', {
@@ -48,7 +56,7 @@ export class AlbumShareStack extends Stack {
       description: 'API Gateway for Photoshare',
       defaultCorsPreflightOptions: {
         allowOrigins: ["http://localhost:5173"],
-        allowMethods: ["GET", "OPTIONS"],
+        allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
         allowHeaders: [
           "Content-Type",
           "X-Amz-Date",
@@ -59,12 +67,6 @@ export class AlbumShareStack extends Stack {
           "x-amz-content-sha256"
         ],
       },
-    });
-
-    // Photos end point
-    const photos = api.root.addResource('photos');
-    photos.addMethod('GET', new apigateway.LambdaIntegration(InventoryDescriber), {
-        authorizationType: apigateway.AuthorizationType.IAM, // Require signed IAM calls
     });
     
     //Create IAM role that will be used to give permissions to the react agent
@@ -86,26 +88,104 @@ export class AlbumShareStack extends Stack {
     new iam.PolicyStatement({
       actions: ["sts:AssumeRole"],
       resources: [reactAlbumReaderRole.roleArn],
-    })
-    )
+    }))
 
     // Allow the React user to call the API Gateway GET /photos endpoint
     reactUser.addToPolicy(
       new iam.PolicyStatement({
         actions: ["execute-api:Invoke"],
         resources: ["arn:aws:execute-api:us-west-2:129045776282:mtkjcuwe3g/*"],
-      })
-    );
+    }));
 
     //Naturally this user will user the react reader role - trust policy
     reactAlbumReaderRole.assumeRolePolicy?.addStatements(
     new iam.PolicyStatement({
       actions: ["sts:AssumeRole"],
       principals: [reactUser],
-    })
+    }));
 
-  );
+    // ==========================
+    // Cognito User Pool (MVP)
+    // ==========================
 
+    const userPool = new cognito.UserPool(this, 'AlbumUserPool', {
+      selfSignUpEnabled: false, // Only admins can create users
+      signInAliases: { email: true },
+      autoVerify: { email: true },
+      passwordPolicy: {
+        minLength: 8,
+        requireLowercase: true,
+        requireUppercase: false,
+        requireDigits: true,
+        requireSymbols: false,
+      },
+    });
+
+    const userPoolClient = new cognito.UserPoolClient(this, 'AlbumUserPoolClient', {
+      userPool,
+      generateSecret: false,
+      authFlows: {
+        userPassword: true,
+        userSrp: true,
+      },
+      oAuth: {
+        flows: {
+          authorizationCodeGrant: true,
+        },
+        scopes: [
+          cognito.OAuthScope.OPENID,
+          cognito.OAuthScope.EMAIL,
+          cognito.OAuthScope.PROFILE,
+        ],
+        // For now we assume local dev React on 5173
+        callbackUrls: ['http://localhost:5173'],
+        logoutUrls: ['http://localhost:5173'],
+      },
+    });
+
+    const albumUserPoolAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, "AlbumUserPoolAuthorizer", {
+        cognitoUserPools: [userPool],
+    });
+
+    // Lambda function for managing favorites
+    const manageFavoritesFunction = new lambda.Function(this, 'ManageFavoritesFunction', {
+      functionName: "Album-Share-Manage-Favorites",
+      description: "Add or remove photo favorites for users",
+      runtime: lambda.Runtime.NODEJS_18_X,
+      handler: 'manage-favorites.handler',
+      code: lambda.Code.fromAsset('lambda'),
+      environment: {
+        TABLE_NAME: favoritesTable.tableName,
+      },
+    });
+
+    // Grant Lambda permission to read/write favorites table
+    favoritesTable.grantReadWriteData(manageFavoritesFunction);
+
+    // Photos end point - Cognito authentication
+    const photos = api.root.addResource('photos');
+    photos.addMethod('GET', new apigateway.LambdaIntegration(InventoryDescriber), {
+        authorizer: albumUserPoolAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+
+    // Favorites endpoint - POST to add, DELETE to remove
+    const favorites = api.root.addResource('favorites');
+    favorites.addMethod('POST', new apigateway.LambdaIntegration(manageFavoritesFunction), {
+        authorizer: albumUserPoolAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    favorites.addMethod('DELETE', new apigateway.LambdaIntegration(manageFavoritesFunction), {
+        authorizer: albumUserPoolAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+
+    const userPoolDomain = new cognito.UserPoolDomain(this, 'AlbumUserPoolDomain', {
+      userPool,
+      cognitoDomain: {
+        domainPrefix: `albumshare-${this.account}`, // must be globally unique per region
+      },
+    });
 
     // ========================================
     // Resource List
@@ -121,9 +201,33 @@ export class AlbumShareStack extends Stack {
       description: 'S3 bucket name'
     });
 
+    new CfnOutput(this, 'FavoritesTableName', {
+      value: favoritesTable.tableName,
+      description: 'DynamoDB table for favorites'
+    });
+
     new CfnOutput(this, "ReactAlbumUserName", {
       value: reactUser.userName,
       description: "IAM user name for React app access",
+    });
+
+    // Outputs so you can copy these into React later
+    new CfnOutput(this, 'UserPoolId', {
+      value: userPool.userPoolId,
+      description: 'Cognito User Pool ID',
+    });
+
+    new CfnOutput(this, 'UserPoolClientId', {
+      value: userPoolClient.userPoolClientId,
+      description: 'Cognito User Pool client ID for the web app',
+    });
+
+    new CfnOutput(this, 'CognitoLoginUrl', {
+      value: userPoolDomain.baseUrl() +
+        '/login?client_id=' +
+        userPoolClient.userPoolClientId +
+        '&response_type=code&scope=email+openid+profile&redirect_uri=http://localhost:5173',
+      description: 'Hosted UI login URL for local dev',
     });
 
         // ========================================
