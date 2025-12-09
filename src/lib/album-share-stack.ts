@@ -7,6 +7,8 @@ import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
+import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 
 export class AlbumShareStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {7
@@ -21,8 +23,18 @@ export class AlbumShareStack extends Stack {
       bucketName: `album-share-photo-bucket-${this.account}-${this.region}`,
       removalPolicy: RemovalPolicy.RETAIN, // keeps bucket even if stack is deleted
       versioned: false,
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, // no public access, its intended to be read by the ReactAlbumReader
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, // private bucket, accessed via CloudFront
       enforceSSL: true,
+    });
+
+    // CloudFront distribution for photo delivery
+    const photoDistribution = new cloudfront.Distribution(this, 'PhotoDistribution', {
+      defaultBehavior: {
+        origin: new origins.S3Origin(photoBucket),
+        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED, // cache images for 24 hours
+      },
+      comment: 'CDN for album photos',
     });
 
     // DynamoDB table for favorites (userId + photoKey)
@@ -51,6 +63,7 @@ export class AlbumShareStack extends Stack {
       environment: {
         BUCKET_NAME: photoBucket.bucketName,
         FAVORITES_TABLE: favoritesTable.tableName,
+        CLOUDFRONT_DOMAIN: photoDistribution.distributionDomainName,
       },
     });
 
@@ -247,6 +260,11 @@ export class AlbumShareStack extends Stack {
     new CfnOutput(this, 'TagsTableName', {
       value: tagsTable.tableName,
       description: 'DynamoDB table for tags'
+    });
+
+    new CfnOutput(this, 'CloudFrontDomain', {
+      value: photoDistribution.distributionDomainName,
+      description: 'CloudFront domain for photo delivery'
     });
 
     new CfnOutput(this, "ReactAlbumUserName", {

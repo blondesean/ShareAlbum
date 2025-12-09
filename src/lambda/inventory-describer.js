@@ -6,6 +6,7 @@ const s3 = new S3Client({ region: "us-west-2" });
 const dynamodb = new DynamoDBClient({ region: "us-west-2" });
 const BUCKET = process.env.BUCKET_NAME;
 const FAVORITES_TABLE = process.env.FAVORITES_TABLE;
+const CLOUDFRONT_DOMAIN = process.env.CLOUDFRONT_DOMAIN;
 
 exports.handler = async (event) => {
   try {
@@ -35,20 +36,28 @@ exports.handler = async (event) => {
       );
     }
 
-    // Generate signed URLs for each photo (valid for 1 hour)
+    // Generate CloudFront URLs for each photo (or signed S3 URLs as fallback)
     const photos = await Promise.all(
       (data.Contents || [])
         .filter(obj => obj.Key && obj.Key.endsWith(".jpg"))
         .map(async (obj) => {
-          const getObjectCommand = new GetObjectCommand({
-            Bucket: BUCKET,
-            Key: obj.Key,
-          });
-          const signedUrl = await getSignedUrl(s3, getObjectCommand, { expiresIn: 3600 });
+          let url;
+          
+          if (CLOUDFRONT_DOMAIN) {
+            // Use CloudFront URL (cached, faster)
+            url = `https://${CLOUDFRONT_DOMAIN}/${obj.Key}`;
+          } else {
+            // Fallback to signed S3 URL
+            const getObjectCommand = new GetObjectCommand({
+              Bucket: BUCKET,
+              Key: obj.Key,
+            });
+            url = await getSignedUrl(s3, getObjectCommand, { expiresIn: 3600 });
+          }
           
           return {
             key: obj.Key,
-            url: signedUrl,
+            url: url,
             isFavorite: userFavorites.has(obj.Key),
           };
         })
