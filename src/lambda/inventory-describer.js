@@ -1,6 +1,6 @@
 const { S3Client, ListObjectsV2Command, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
-const { DynamoDBClient, QueryCommand } = require("@aws-sdk/client-dynamodb");
+const { DynamoDBClient, QueryCommand, ScanCommand } = require("@aws-sdk/client-dynamodb");
 
 const s3 = new S3Client({ region: "us-west-2" });
 const dynamodb = new DynamoDBClient({ region: "us-west-2" });
@@ -20,10 +20,13 @@ exports.handler = async (event) => {
     const command = new ListObjectsV2Command({ Bucket: BUCKET });
     const data = await s3.send(command);
 
-    // Get user's favorites if authenticated
+    // Get user's favorites and all favorite counts if authenticated
     let userFavorites = new Set();
+    let favoriteCounts = new Map();
+    
     if (userId && FAVORITES_TABLE) {
-      const favoritesResult = await dynamodb.send(new QueryCommand({
+      // Get current user's favorites
+      const userFavoritesResult = await dynamodb.send(new QueryCommand({
         TableName: FAVORITES_TABLE,
         KeyConditionExpression: 'userId = :userId',
         ExpressionAttributeValues: {
@@ -32,8 +35,20 @@ exports.handler = async (event) => {
       }));
       
       userFavorites = new Set(
-        (favoritesResult.Items || []).map(item => item.photoKey.S)
+        (userFavoritesResult.Items || []).map(item => item.photoKey.S)
       );
+
+      // Get all favorites to count per photo (scan entire table)
+      const allFavoritesResult = await dynamodb.send(new ScanCommand({
+        TableName: FAVORITES_TABLE,
+        ProjectionExpression: 'photoKey'
+      }));
+
+      // Count favorites per photo
+      (allFavoritesResult.Items || []).forEach(item => {
+        const photoKey = item.photoKey.S;
+        favoriteCounts.set(photoKey, (favoriteCounts.get(photoKey) || 0) + 1);
+      });
     }
 
     // Generate CloudFront URLs for each photo (or signed S3 URLs as fallback)
@@ -59,6 +74,7 @@ exports.handler = async (event) => {
             key: obj.Key,
             url: url,
             isFavorite: userFavorites.has(obj.Key),
+            favoriteCount: favoriteCounts.get(obj.Key) || 0,
           };
         })
     );

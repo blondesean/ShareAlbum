@@ -25,6 +25,14 @@ export class AlbumShareStack extends Stack {
       versioned: false,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, // private bucket, accessed via CloudFront
       enforceSSL: true,
+      cors: [
+        {
+          allowedHeaders: ['*'],
+          allowedMethods: [s3.HttpMethods.PUT, s3.HttpMethods.POST, s3.HttpMethods.GET],
+          allowedOrigins: ['http://localhost:5173'], // Your React dev server
+          exposedHeaders: ['ETag'],
+        },
+      ],
     });
 
     // CloudFront distribution for photo delivery
@@ -205,6 +213,21 @@ export class AlbumShareStack extends Stack {
     // Grant Lambda permission to read/write tags table
     tagsTable.grantReadWriteData(manageTagsFunction);
 
+    // Lambda function for generating upload URLs
+    const generateUploadUrlFunction = new lambda.Function(this, 'GenerateUploadUrlFunction', {
+      functionName: "Album-Share-Generate-Upload-URL",
+      description: "Generate presigned URLs for photo uploads",
+      runtime: lambda.Runtime.NODEJS_18_X,
+      handler: 'generate-upload-url.handler',
+      code: lambda.Code.fromAsset('lambda'),
+      environment: {
+        BUCKET_NAME: photoBucket.bucketName,
+      },
+    });
+
+    // Grant Lambda permission to write to S3 bucket
+    photoBucket.grantWrite(generateUploadUrlFunction);
+
     // Favorites endpoint - POST to add, DELETE to remove
     const favorites = api.root.addResource('favorites');
     favorites.addMethod('POST', new apigateway.LambdaIntegration(manageFavoritesFunction), {
@@ -227,6 +250,13 @@ export class AlbumShareStack extends Stack {
         authorizationType: apigateway.AuthorizationType.COGNITO,
     });
     tags.addMethod('GET', new apigateway.LambdaIntegration(manageTagsFunction), {
+        authorizer: albumUserPoolAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+
+    // Upload endpoint - POST to get presigned upload URL
+    const upload = api.root.addResource('upload-url');
+    upload.addMethod('POST', new apigateway.LambdaIntegration(generateUploadUrlFunction), {
         authorizer: albumUserPoolAuthorizer,
         authorizationType: apigateway.AuthorizationType.COGNITO,
     });
