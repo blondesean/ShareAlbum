@@ -1,6 +1,12 @@
 !jest.config.js
 *.d.ts
 node_modules
+*cloudfront-private-key.pem
+*cloudfront-public-key.pem
+cloudfront-private-key.pem
+cloudfront-public-key.pem
+**/*cloudfront*.pem
+**/.aws-keys/
 
 # CDK asset staging directory
 .cdk.staging

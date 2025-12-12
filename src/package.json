@@ -29,6 +29,7 @@
     "@aws-cdk/aws-lambda": "^1.204.0",
     "@aws-cdk/aws-s3": "^1.204.0",
     "@aws-cdk/aws-s3-deployment": "^1.204.0",
+    "@aws-sdk/cloudfront-signer": "^3.946.0",
     "aws-cdk-lib": "^2.215.0",
     "constructs": "^10.4.2"
   }

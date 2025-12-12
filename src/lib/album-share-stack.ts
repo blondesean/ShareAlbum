@@ -1,6 +1,6 @@
-import { Stack, StackProps, RemovalPolicy, CfnOutput } from 'aws-cdk-lib';
+import { Stack, StackProps, RemovalPolicy, CfnOutput, Duration } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
-import { AuthorizationType } from "aws-cdk-lib/aws-apigateway";
+
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
@@ -9,9 +9,14 @@ import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
+import * as fs from "fs";
+import * as path from "path";
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+
+import { CfnPublicKey, CfnKeyGroup } from 'aws-cdk-lib/aws-cloudfront';
 
 export class AlbumShareStack extends Stack {
-  constructor(scope: Construct, id: string, props?: StackProps) {7
+  constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
 
     // ========================================
@@ -35,15 +40,45 @@ export class AlbumShareStack extends Stack {
       ],
     });
 
-    // CloudFront distribution for photo delivery
-    const photoDistribution = new cloudfront.Distribution(this, 'PhotoDistribution', {
-      defaultBehavior: {
-        origin: new origins.S3Origin(photoBucket),
-        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-        cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED, // cache images for 24 hours
+    // CloudFront signed URLs setup for secure photo access
+    // Secret to store the CloudFront private key (user must populate this after generating key pair)
+    const cloudfrontPrivateKeySecret = new secretsmanager.Secret(this, 'CloudFrontPrivateKeySecret', {
+      secretName: `album-share-cloudfront-private-key-${this.account}`,
+      description: 'Private key for CloudFront signed URLs - populate after generating key pair',
+      generateSecretString: {
+        secretStringTemplate: JSON.stringify({ privateKey: '' }),
+        generateStringKey: 'placeholder',
+        excludeCharacters: '',
       },
-      comment: 'CDN for album photos',
     });
+
+    // CloudFront public key (user must provide public key after generating key pair)
+    // Key Location
+    const cloudfrontPublicKeyValue = fs.readFileSync(
+      path.join(__dirname, "..", "..", "cloudfront-public-key.pem"),
+      "utf8"
+    ).replace(/\r\n/g, "\n").trim();
+    
+    const cloudfrontPublicKey = new CfnPublicKey(this, 'CloudFrontPublicKey', {
+      publicKeyConfig: {
+        // Use a stable callerReference that doesn't change on each deployment
+        callerReference: `album-share-public-key-${this.account}`,
+        name: `album-share-public-key-${this.account}`,
+        encodedKey: cloudfrontPublicKeyValue,
+        comment: 'Public key for CloudFront signed URLs',
+      },
+    });
+
+    // CloudFront key group
+    const cloudfrontKeyGroup = new CfnKeyGroup(this, 'CloudFrontKeyGroup', {
+      keyGroupConfig: {
+        name: `album-share-key-group-${this.account}`,
+        items: [cloudfrontPublicKey.ref],
+        comment: 'Key group for CloudFront signed URLs',
+      },
+    });
+
+
 
     // DynamoDB table for favorites (userId + photoKey)
     const favoritesTable = new dynamodb.Table(this, 'FavoritesTable', {
@@ -61,28 +96,33 @@ export class AlbumShareStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
     });
 
-    // Lambda function that lists photos and signed URLs
+    // Lambda function that lists photos and signed URLs (environment set after CloudFront creation)
     const InventoryDescriber = new lambda.Function(this, 'InventoryDescriber', {
       functionName: "Album-Share-Inventory-Describer",
       description: "List the photos contained in the bucket and provides signed URLs",
       runtime: lambda.Runtime.NODEJS_18_X,
       handler: 'inventory-describer.handler',
       code: lambda.Code.fromAsset('lambda'),
+      timeout: Duration.seconds(30), // Increase timeout for CloudFront signed URL generation
       environment: {
         BUCKET_NAME: photoBucket.bucketName,
         FAVORITES_TABLE: favoritesTable.tableName,
-        CLOUDFRONT_DOMAIN: photoDistribution.distributionDomainName,
+        CLOUDFRONT_KEY_PAIR_ID: cloudfrontPublicKey.attrId,
+        CLOUDFRONT_PRIVATE_KEY_SECRET_NAME: cloudfrontPrivateKeySecret.secretName,
       },
     });
 
     // Grant Lambda permission to read from S3 bucket and favorites table
     photoBucket.grantRead(InventoryDescriber);
     favoritesTable.grantReadData(InventoryDescriber);
+    
+    // Grant Lambda permission to read the CloudFront private key from Secrets Manager
+    cloudfrontPrivateKeySecret.grantRead(InventoryDescriber);
 
     // API Gateway
-    const api = new apigateway.RestApi(this, 'PhotoApiAS', {
-      restApiName: 'Photo Service',
-      description: 'API Gateway for Photoshare',
+    const api = new apigateway.RestApi(this, "PhotoApiAS", {
+      restApiName: "Photo Service",
+      description: "API Gateway for Photoshare",
       defaultCorsPreflightOptions: {
         allowOrigins: ["http://localhost:5173"],
         allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
@@ -93,8 +133,29 @@ export class AlbumShareStack extends Stack {
           "X-Api-Key",
           "X-Amz-Security-Token",
           "X-Amz-User-Agent",
-          "x-amz-content-sha256"
+          "x-amz-content-sha256",
         ],
+      },
+    });
+
+    // Add CORS headers to API Gateway *error* responses too (so the browser doesn't mask 401/403/5xx as "CORS")
+    api.addGatewayResponse("Default4xx", {
+      type: apigateway.ResponseType.DEFAULT_4XX,
+      responseHeaders: {
+        "Access-Control-Allow-Origin": "'http://localhost:5173'",
+        "Access-Control-Allow-Headers":
+          "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Amz-User-Agent,x-amz-content-sha256'",
+        "Access-Control-Allow-Methods": "'GET,POST,DELETE,OPTIONS'",
+      },
+    });
+
+    api.addGatewayResponse("Default5xx", {
+      type: apigateway.ResponseType.DEFAULT_5XX,
+      responseHeaders: {
+        "Access-Control-Allow-Origin": "'http://localhost:5173'",
+        "Access-Control-Allow-Headers":
+          "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Amz-User-Agent,x-amz-content-sha256'",
+        "Access-Control-Allow-Methods": "'GET,POST,DELETE,OPTIONS'",
       },
     });
     
@@ -268,6 +329,38 @@ export class AlbumShareStack extends Stack {
       },
     });
 
+    // Create a response headers policy for CORS
+    const corsResponseHeadersPolicy = new cloudfront.ResponseHeadersPolicy(this, 'CorsResponseHeadersPolicy', {
+      responseHeadersPolicyName: `album-share-cors-policy-${this.account}`,
+      comment: 'CORS policy for album photos',
+      corsBehavior: {
+        accessControlAllowCredentials: false,
+        accessControlAllowHeaders: ['*'],
+        accessControlAllowMethods: ['GET', 'HEAD', 'OPTIONS'],
+        accessControlAllowOrigins: ['http://localhost:5173', 'https://localhost:5173'],
+        accessControlExposeHeaders: ['*'],
+        accessControlMaxAge: Duration.seconds(86400), // 24 hours
+        originOverride: true,
+      },
+    });
+
+    // CloudFront distribution for photo delivery with signed URLs required
+    const photoDistribution = new cloudfront.Distribution(this, 'PhotoDistribution', {
+      defaultBehavior: {
+        origin: new origins.S3Origin(photoBucket),
+        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED, // cache images for 24 hours
+        responseHeadersPolicy: corsResponseHeadersPolicy, // Add CORS headers
+        trustedKeyGroups: [cloudfront.KeyGroup.fromKeyGroupId(this, 'ImportedKeyGroup', cloudfrontKeyGroup.attrId)],
+      },
+      comment: 'CDN for album photos with signed URLs and CORS support',
+    });
+
+    // Add CloudFront domain to Lambda environment after distribution is created
+    InventoryDescriber.addEnvironment('CLOUDFRONT_DOMAIN', photoDistribution.distributionDomainName);
+
+
+
     // ========================================
     // Resource List
     // ========================================
@@ -295,6 +388,18 @@ export class AlbumShareStack extends Stack {
     new CfnOutput(this, 'CloudFrontDomain', {
       value: photoDistribution.distributionDomainName,
       description: 'CloudFront domain for photo delivery'
+    });
+
+
+
+    new CfnOutput(this, 'CloudFrontPublicKeyId', {
+      value: cloudfrontPublicKey.attrId,
+      description: 'CloudFront public key ID - use this when generating key pairs'
+    });
+
+    new CfnOutput(this, 'CloudFrontPrivateKeySecretName', {
+      value: cloudfrontPrivateKeySecret.secretName,
+      description: 'Secrets Manager secret name - populate this with your CloudFront private key after generating key pair'
     });
 
     new CfnOutput(this, "ReactAlbumUserName", {
