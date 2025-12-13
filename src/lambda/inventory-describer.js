@@ -111,7 +111,28 @@ exports.handler = async (event) => {
     // Get user ID from Cognito authorizer
     const userId = event.requestContext?.authorizer?.claims?.sub;
 
-    const command = new ListObjectsV2Command({ Bucket: BUCKET });
+    // Parse pagination parameters from query string
+    const queryParams = event.queryStringParameters || {};
+    const limit = Math.min(parseInt(queryParams.limit) || 25, 100); // Default 25, max 100
+    const nextToken = queryParams.nextToken || null;
+
+    // Build S3 ListObjectsV2 command with pagination
+    const listParams = {
+      Bucket: BUCKET,
+      MaxKeys: limit,
+    };
+
+    // Add continuation token if provided
+    if (nextToken) {
+      try {
+        // Decode the nextToken (base64 encoded S3 continuation token)
+        listParams.ContinuationToken = Buffer.from(nextToken, 'base64').toString('utf-8');
+      } catch (error) {
+        throw new Error("Invalid nextToken provided");
+      }
+    }
+
+    const command = new ListObjectsV2Command(listParams);
     const data = await s3.send(command);
 
     // Get user's favorites and all favorite counts if authenticated
@@ -150,35 +171,52 @@ exports.handler = async (event) => {
       await getPrivateKey(); // This will cache the key for all subsequent calls
     }
 
+    // Filter for image files only
+    const imageObjects = (data.Contents || [])
+      .filter(obj => obj.Key && (obj.Key.endsWith(".jpg") || obj.Key.endsWith(".jpeg") || obj.Key.endsWith(".png") || obj.Key.endsWith(".gif") || obj.Key.endsWith(".webp")));
+
     // Generate CloudFront signed URLs for each photo (secure, cached, cost-effective)
     // URLs expire after 1 hour, ensuring only authenticated users can access photos
     const photos = await Promise.all(
-      (data.Contents || [])
-        .filter(obj => obj.Key && (obj.Key.endsWith(".jpg") || obj.Key.endsWith(".jpeg") || obj.Key.endsWith(".png") || obj.Key.endsWith(".gif") || obj.Key.endsWith(".webp")))
-        .map(async (obj) => {
-          let photoUrl;
-          
-          // Use CloudFront signed URLs if configured, otherwise fallback to error
-          if (CLOUDFRONT_DOMAIN && CLOUDFRONT_KEY_PAIR_ID) {
-            try {
-              photoUrl = await getCloudFrontSignedUrl(obj.Key, 3600); // 1 hour expiration
-            } catch (error) {
-              console.error(`Error generating CloudFront signed URL for ${obj.Key}:`, error);
-              // If CloudFront signing fails (e.g., private key not configured), throw error
-              throw new Error(`Failed to generate signed URL: ${error.message}`);
-            }
-          } else {
-            throw new Error("CloudFront configuration missing. Please configure CLOUDFRONT_DOMAIN and CLOUDFRONT_KEY_PAIR_ID.");
+      imageObjects.map(async (obj) => {
+        let photoUrl;
+        
+        // Use CloudFront signed URLs if configured, otherwise fallback to error
+        if (CLOUDFRONT_DOMAIN && CLOUDFRONT_KEY_PAIR_ID) {
+          try {
+            photoUrl = await getCloudFrontSignedUrl(obj.Key, 3600); // 1 hour expiration
+          } catch (error) {
+            console.error(`Error generating CloudFront signed URL for ${obj.Key}:`, error);
+            // If CloudFront signing fails (e.g., private key not configured), throw error
+            throw new Error(`Failed to generate signed URL: ${error.message}`);
           }
-          
-          return {
-            key: obj.Key,
-            url: photoUrl,
-            isFavorite: userFavorites.has(obj.Key),
-            favoriteCount: favoriteCounts.get(obj.Key) || 0,
-          };
-        })
+        } else {
+          throw new Error("CloudFront configuration missing. Please configure CLOUDFRONT_DOMAIN and CLOUDFRONT_KEY_PAIR_ID.");
+        }
+        
+        return {
+          key: obj.Key,
+          url: photoUrl,
+          isFavorite: userFavorites.has(obj.Key),
+          favoriteCount: favoriteCounts.get(obj.Key) || 0,
+        };
+      })
     );
+
+    // Prepare response with pagination metadata
+    const response = {
+      photos,
+      pagination: {
+        limit,
+        count: photos.length,
+        hasMore: data.IsTruncated || false,
+      }
+    };
+
+    // Add nextToken if there are more results
+    if (data.IsTruncated && data.NextContinuationToken) {
+      response.pagination.nextToken = Buffer.from(data.NextContinuationToken, 'utf-8').toString('base64');
+    }
     
     return {
       statusCode: 200,
@@ -187,7 +225,7 @@ exports.handler = async (event) => {
         "Access-Control-Allow-Headers": "Content-Type,Authorization",
         "Access-Control-Allow-Methods": "GET,OPTIONS",
       },
-      body: JSON.stringify(photos),
+      body: JSON.stringify(response),
     };
     
   } catch (err) {

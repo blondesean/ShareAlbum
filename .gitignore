@@ -1,0 +1,23 @@
+# CloudFront keys - NEVER commit these!
+*.pem
+**/*cloudfront*.pem
+**/.aws-keys/
+cloudfront-private-key.pem
+cloudfront-public-key.pem
+
+# Node modules
+node_modules/
+
+# CDK
+.cdk.staging
+cdk.out
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+
