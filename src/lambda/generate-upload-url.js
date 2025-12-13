@@ -4,7 +4,19 @@ const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const s3 = new S3Client({ region: "us-west-2" });
 const BUCKET = process.env.BUCKET_NAME;
 
+// Helper function to get appropriate CORS origin
+function getCorsOrigin(event) {
+  const origin = event.headers?.origin || event.headers?.Origin;
+  const allowedOrigins = [
+    'http://localhost:5173',
+    'https://albumsharesdd.netlify.app'
+  ];
+  return allowedOrigins.includes(origin) ? origin : 'http://localhost:5173';
+}
+
 exports.handler = async (event) => {
+  const corsOrigin = getCorsOrigin(event);
+  
   try {
     // Get user ID from Cognito authorizer
     const userId = event.requestContext.authorizer.claims.sub;
@@ -18,8 +30,9 @@ exports.handler = async (event) => {
       return {
         statusCode: 400,
         headers: {
-          "Access-Control-Allow-Origin": "http://localhost:5173",
+          "Access-Control-Allow-Origin": corsOrigin,
           "Access-Control-Allow-Headers": "Content-Type,Authorization",
+          "Access-Control-Allow-Credentials": "false",
         },
         body: JSON.stringify({ 
           error: "fileName and fileType are required" 
@@ -33,8 +46,9 @@ exports.handler = async (event) => {
       return {
         statusCode: 400,
         headers: {
-          "Access-Control-Allow-Origin": "http://localhost:5173",
+          "Access-Control-Allow-Origin": corsOrigin,
           "Access-Control-Allow-Headers": "Content-Type,Authorization",
+          "Access-Control-Allow-Credentials": "false",
         },
         body: JSON.stringify({ 
           error: "Only image files are allowed (JPEG, PNG, GIF, WebP)" 
@@ -59,8 +73,9 @@ exports.handler = async (event) => {
     return {
       statusCode: 200,
       headers: {
-        "Access-Control-Allow-Origin": "http://localhost:5173",
+        "Access-Control-Allow-Origin": corsOrigin,
         "Access-Control-Allow-Headers": "Content-Type,Authorization",
+        "Access-Control-Allow-Credentials": "false",
       },
       body: JSON.stringify({
         uploadUrl: uploadUrl,
@@ -73,8 +88,9 @@ exports.handler = async (event) => {
     return {
       statusCode: 500,
       headers: {
-        "Access-Control-Allow-Origin": "http://localhost:5173",
+        "Access-Control-Allow-Origin": corsOrigin,
         "Access-Control-Allow-Headers": "Content-Type,Authorization",
+        "Access-Control-Allow-Credentials": "false",
       },
       body: JSON.stringify({ error: err.message }),
     };

@@ -3,7 +3,19 @@ const { DynamoDBClient, PutItemCommand, DeleteItemCommand, QueryCommand } = requ
 const dynamodb = new DynamoDBClient({ region: "us-west-2" });
 const TABLE_NAME = process.env.TABLE_NAME;
 
+// Helper function to get appropriate CORS origin
+function getCorsOrigin(event) {
+  const origin = event.headers?.origin || event.headers?.Origin;
+  const allowedOrigins = [
+    'http://localhost:5173',
+    'https://albumsharesdd.netlify.app'
+  ];
+  return allowedOrigins.includes(origin) ? origin : 'http://localhost:5173';
+}
+
 exports.handler = async (event) => {
+  const corsOrigin = getCorsOrigin(event);
+  
   try {
     // Get user ID from Cognito authorizer
     const userId = event.requestContext.authorizer.claims.sub;
@@ -23,8 +35,9 @@ exports.handler = async (event) => {
       return {
         statusCode: 400,
         headers: {
-          "Access-Control-Allow-Origin": "http://localhost:5173",
+          "Access-Control-Allow-Origin": corsOrigin,
           "Access-Control-Allow-Headers": "Content-Type,Authorization",
+          "Access-Control-Allow-Credentials": "false",
         },
         body: JSON.stringify({ error: "photoKey is required" }),
       };
@@ -36,8 +49,9 @@ exports.handler = async (event) => {
         return {
           statusCode: 400,
           headers: {
-            "Access-Control-Allow-Origin": "http://localhost:5173",
+            "Access-Control-Allow-Origin": corsOrigin,
             "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Access-Control-Allow-Credentials": "false",
           },
           body: JSON.stringify({ error: "tag is required" }),
         };
@@ -59,8 +73,9 @@ exports.handler = async (event) => {
       return {
         statusCode: 200,
         headers: {
-          "Access-Control-Allow-Origin": "http://localhost:5173",
+          "Access-Control-Allow-Origin": corsOrigin,
           "Access-Control-Allow-Headers": "Content-Type,Authorization",
+          "Access-Control-Allow-Credentials": "false",
         },
         body: JSON.stringify({ message: "Tag added", tag: tag.trim() }),
       };
@@ -72,8 +87,9 @@ exports.handler = async (event) => {
         return {
           statusCode: 400,
           headers: {
-            "Access-Control-Allow-Origin": "http://localhost:5173",
+            "Access-Control-Allow-Origin": corsOrigin,
             "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Access-Control-Allow-Credentials": "false",
           },
           body: JSON.stringify({ error: "tag is required" }),
         };
@@ -92,8 +108,9 @@ exports.handler = async (event) => {
       return {
         statusCode: 200,
         headers: {
-          "Access-Control-Allow-Origin": "http://localhost:5173",
+          "Access-Control-Allow-Origin": corsOrigin,
           "Access-Control-Allow-Headers": "Content-Type,Authorization",
+          "Access-Control-Allow-Credentials": "false",
         },
         body: JSON.stringify({ message: "Tag removed" }),
       };
@@ -118,8 +135,9 @@ exports.handler = async (event) => {
       return {
         statusCode: 200,
         headers: {
-          "Access-Control-Allow-Origin": "http://localhost:5173",
+          "Access-Control-Allow-Origin": corsOrigin,
           "Access-Control-Allow-Headers": "Content-Type,Authorization",
+          "Access-Control-Allow-Credentials": "false",
         },
         body: JSON.stringify({ tags }),
       };
@@ -128,7 +146,8 @@ exports.handler = async (event) => {
     return {
       statusCode: 405,
       headers: {
-        "Access-Control-Allow-Origin": "http://localhost:5173",
+        "Access-Control-Allow-Origin": corsOrigin,
+        "Access-Control-Allow-Credentials": "false",
       },
       body: JSON.stringify({ error: "Method not allowed" }),
     };
@@ -137,7 +156,8 @@ exports.handler = async (event) => {
     return {
       statusCode: 500,
       headers: {
-        "Access-Control-Allow-Origin": "http://localhost:5173",
+        "Access-Control-Allow-Origin": corsOrigin,
+        "Access-Control-Allow-Credentials": "false",
       },
       body: JSON.stringify({ error: err.message }),
     };

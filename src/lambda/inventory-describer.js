@@ -218,24 +218,42 @@ exports.handler = async (event) => {
       response.pagination.nextToken = Buffer.from(data.NextContinuationToken, 'utf-8').toString('base64');
     }
     
+    // Determine the appropriate CORS origin
+    const origin = event.headers?.origin || event.headers?.Origin;
+    const allowedOrigins = [
+      'http://localhost:5173',
+      'https://albumsharesdd.netlify.app'
+    ];
+    const corsOrigin = allowedOrigins.includes(origin) ? origin : 'http://localhost:5173';
+
     return {
       statusCode: 200,
       headers: {
-        "Access-Control-Allow-Origin": "http://localhost:5173",
+        "Access-Control-Allow-Origin": corsOrigin,
         "Access-Control-Allow-Headers": "Content-Type,Authorization",
         "Access-Control-Allow-Methods": "GET,OPTIONS",
+        "Access-Control-Allow-Credentials": "false",
       },
       body: JSON.stringify(response),
     };
     
   } catch (err) {
     console.error(err);
+    // Determine the appropriate CORS origin for error responses
+    const origin = event.headers?.origin || event.headers?.Origin;
+    const allowedOrigins = [
+      'http://localhost:5173',
+      'https://albumsharesdd.netlify.app'
+    ];
+    const corsOrigin = allowedOrigins.includes(origin) ? origin : 'http://localhost:5173';
+
     return {
       statusCode: 500,
       headers: {
-        "Access-Control-Allow-Origin": "http://localhost:5173",
+        "Access-Control-Allow-Origin": corsOrigin,
         "Access-Control-Allow-Headers": "Content-Type,Authorization",
         "Access-Control-Allow-Methods": "GET,OPTIONS",
+        "Access-Control-Allow-Credentials": "false",
       },
       body: JSON.stringify({ error: err.message }),
     };

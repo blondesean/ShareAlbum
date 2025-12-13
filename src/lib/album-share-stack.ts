@@ -34,7 +34,10 @@ export class AlbumShareStack extends Stack {
         {
           allowedHeaders: ['*'],
           allowedMethods: [s3.HttpMethods.PUT, s3.HttpMethods.POST, s3.HttpMethods.GET],
-          allowedOrigins: ['http://localhost:5173'], // Your React dev server
+          allowedOrigins: [
+            'http://localhost:5173', // Your React dev server
+            'https://albumsharesdd.netlify.app' // Production Netlify domain
+          ],
           exposedHeaders: ['ETag'],
         },
       ],
@@ -124,7 +127,10 @@ export class AlbumShareStack extends Stack {
       restApiName: "Photo Service",
       description: "API Gateway for Photoshare",
       defaultCorsPreflightOptions: {
-        allowOrigins: ["http://localhost:5173"],
+        allowOrigins: [
+          "http://localhost:5173",
+          "https://albumsharesdd.netlify.app"
+        ],
         allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
         allowHeaders: [
           "Content-Type",
@@ -142,7 +148,7 @@ export class AlbumShareStack extends Stack {
     api.addGatewayResponse("Default4xx", {
       type: apigateway.ResponseType.DEFAULT_4XX,
       responseHeaders: {
-        "Access-Control-Allow-Origin": "'http://localhost:5173'",
+        "Access-Control-Allow-Origin": "'*'", // Allow all origins for error responses
         "Access-Control-Allow-Headers":
           "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Amz-User-Agent,x-amz-content-sha256'",
         "Access-Control-Allow-Methods": "'GET,POST,DELETE,OPTIONS'",
@@ -152,7 +158,7 @@ export class AlbumShareStack extends Stack {
     api.addGatewayResponse("Default5xx", {
       type: apigateway.ResponseType.DEFAULT_5XX,
       responseHeaders: {
-        "Access-Control-Allow-Origin": "'http://localhost:5173'",
+        "Access-Control-Allow-Origin": "'*'", // Allow all origins for error responses
         "Access-Control-Allow-Headers":
           "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Amz-User-Agent,x-amz-content-sha256'",
         "Access-Control-Allow-Methods": "'GET,POST,DELETE,OPTIONS'",
@@ -227,9 +233,15 @@ export class AlbumShareStack extends Stack {
           cognito.OAuthScope.EMAIL,
           cognito.OAuthScope.PROFILE,
         ],
-        // For now we assume local dev React on 5173
-        callbackUrls: ['http://localhost:5173'],
-        logoutUrls: ['http://localhost:5173'],
+        // Local dev and production URLs
+        callbackUrls: [
+          'http://localhost:5173',
+          'https://albumsharesdd.netlify.app'
+        ],
+        logoutUrls: [
+          'http://localhost:5173',
+          'https://albumsharesdd.netlify.app'
+        ],
       },
     });
 
@@ -337,7 +349,11 @@ export class AlbumShareStack extends Stack {
         accessControlAllowCredentials: false,
         accessControlAllowHeaders: ['*'],
         accessControlAllowMethods: ['GET', 'HEAD', 'OPTIONS'],
-        accessControlAllowOrigins: ['http://localhost:5173', 'https://localhost:5173'],
+        accessControlAllowOrigins: [
+          'http://localhost:5173', 
+          'https://localhost:5173',
+          'https://albumsharesdd.netlify.app'
+        ],
         accessControlExposeHeaders: ['*'],
         accessControlMaxAge: Duration.seconds(86400), // 24 hours
         originOverride: true,
@@ -418,12 +434,20 @@ export class AlbumShareStack extends Stack {
       description: 'Cognito User Pool client ID for the web app',
     });
 
-    new CfnOutput(this, 'CognitoLoginUrl', {
+    new CfnOutput(this, 'CognitoLoginUrlDev', {
       value: userPoolDomain.baseUrl() +
         '/login?client_id=' +
         userPoolClient.userPoolClientId +
         '&response_type=code&scope=email+openid+profile&redirect_uri=http://localhost:5173',
-      description: 'Hosted UI login URL for local dev',
+      description: 'Hosted UI login URL for local development',
+    });
+
+    new CfnOutput(this, 'CognitoLoginUrlProd', {
+      value: userPoolDomain.baseUrl() +
+        '/login?client_id=' +
+        userPoolClient.userPoolClientId +
+        '&response_type=code&scope=email+openid+profile&redirect_uri=https://albumsharesdd.netlify.app',
+      description: 'Hosted UI login URL for production (Netlify)',
     });
 
   }
