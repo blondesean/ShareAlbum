@@ -363,7 +363,7 @@ export class AlbumShareStack extends Stack {
     // CloudFront distribution for photo delivery with signed URLs required
     const photoDistribution = new cloudfront.Distribution(this, 'PhotoDistribution', {
       defaultBehavior: {
-        origin: new origins.S3Origin(photoBucket),
+        origin: origins.S3BucketOrigin.withOriginAccessControl(photoBucket),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED, // cache images for 24 hours
         responseHeadersPolicy: corsResponseHeadersPolicy, // Add CORS headers

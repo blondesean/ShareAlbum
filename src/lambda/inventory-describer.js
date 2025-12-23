@@ -122,7 +122,7 @@ exports.handler = async (event) => {
       MaxKeys: limit,
     };
 
-    // Add continuation token if provided
+    // Add continuation token if provided, otherwise use random starting point
     if (nextToken) {
       try {
         // Decode the nextToken (base64 encoded S3 continuation token)
@@ -130,6 +130,11 @@ exports.handler = async (event) => {
       } catch (error) {
         throw new Error("Invalid nextToken provided");
       }
+    } else {
+      // For the first page, start from a random point for discovery
+      const randomPrefixes = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'];
+      const randomPrefix = randomPrefixes[Math.floor(Math.random() * randomPrefixes.length)];
+      listParams.StartAfter = randomPrefix;
     }
 
     const command = new ListObjectsV2Command(listParams);
@@ -171,9 +176,13 @@ exports.handler = async (event) => {
       await getPrivateKey(); // This will cache the key for all subsequent calls
     }
 
-    // Filter for image files only
+    // Filter for image files only - handle potential whitespace/special characters
     const imageObjects = (data.Contents || [])
-      .filter(obj => obj.Key && (obj.Key.endsWith(".jpg") || obj.Key.endsWith(".jpeg") || obj.Key.endsWith(".png") || obj.Key.endsWith(".gif") || obj.Key.endsWith(".webp")));
+      .filter(obj => {
+        if (!obj.Key) return false;
+        const key = obj.Key.trim().toLowerCase();
+        return key.endsWith(".jpg") || key.endsWith(".jpeg") || key.endsWith(".png") || key.endsWith(".gif") || key.endsWith(".webp");
+      });
 
     // Generate CloudFront signed URLs for each photo (secure, cached, cost-effective)
     // URLs expire after 1 hour, ensuring only authenticated users can access photos
@@ -203,13 +212,55 @@ exports.handler = async (event) => {
       })
     );
 
+    // For first page only: Add missing favorites that weren't in the random S3 results
+    if (!nextToken && userFavorites.size > 0) {
+      const photosInResults = new Set(photos.map(p => p.key));
+      const missingFavorites = Array.from(userFavorites).filter(fav => !photosInResults.has(fav));
+      
+      // Generate URLs for missing favorites
+      const missingFavoritePhotos = await Promise.all(
+        missingFavorites.slice(0, limit).map(async (favoriteKey) => {
+          let photoUrl;
+          try {
+            photoUrl = await getCloudFrontSignedUrl(favoriteKey, 3600);
+            return {
+              key: favoriteKey,
+              url: photoUrl,
+              isFavorite: true,
+              favoriteCount: favoriteCounts.get(favoriteKey) || 0,
+            };
+          } catch (error) {
+            console.error(`Error generating URL for favorite ${favoriteKey}:`, error);
+            return null;
+          }
+        })
+      );
+      
+      // Add valid favorite photos to the beginning
+      const validMissingFavorites = missingFavoritePhotos.filter(p => p !== null);
+      photos.unshift(...validMissingFavorites);
+    }
+
+    // Sort photos: favorites first, then random order for discovery
+    photos.sort((a, b) => {
+      // If one is favorite and other isn't, favorite comes first
+      if (a.isFavorite && !b.isFavorite) return -1;
+      if (!a.isFavorite && b.isFavorite) return 1;
+      
+      // If both are favorites or both are not favorites, randomize
+      return Math.random() - 0.5;
+    });
+
+    // For the first page, trim to requested limit after sorting (favorites first, then random)
+    const finalPhotos = nextToken ? photos : photos.slice(0, limit);
+
     // Prepare response with pagination metadata
     const response = {
-      photos,
+      photos: finalPhotos,
       pagination: {
         limit,
-        count: photos.length,
-        hasMore: data.IsTruncated || false,
+        count: finalPhotos.length,
+        hasMore: data.IsTruncated && data.NextContinuationToken ? true : false,
       }
     };
 
@@ -233,6 +284,9 @@ exports.handler = async (event) => {
         "Access-Control-Allow-Headers": "Content-Type,Authorization",
         "Access-Control-Allow-Methods": "GET,OPTIONS",
         "Access-Control-Allow-Credentials": "false",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
       },
       body: JSON.stringify(response),
     };
@@ -254,6 +308,9 @@ exports.handler = async (event) => {
         "Access-Control-Allow-Headers": "Content-Type,Authorization",
         "Access-Control-Allow-Methods": "GET,OPTIONS",
         "Access-Control-Allow-Credentials": "false",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
       },
       body: JSON.stringify({ error: err.message }),
     };
