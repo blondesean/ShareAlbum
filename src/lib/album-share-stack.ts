@@ -264,6 +264,25 @@ export class AlbumShareStack extends Stack {
     // Grant Lambda permission to read/write favorites table
     favoritesTable.grantReadWriteData(manageFavoritesFunction);
 
+    // Lambda function for getting favorites (separate endpoint)
+    const getFavoritesFunction = new lambda.Function(this, 'GetFavoritesFunction', {
+      functionName: "Album-Share-Get-Favorites",
+      description: "Get photos sorted by favorite count",
+      runtime: lambda.Runtime.NODEJS_18_X,
+      handler: 'get-favorites.handler',
+      code: lambda.Code.fromAsset('lambda'),
+      environment: {
+        FAVORITES_TABLE: favoritesTable.tableName,
+        CLOUDFRONT_DOMAIN: '', // Will be set after CloudFront creation
+        CLOUDFRONT_KEY_PAIR_ID: cloudfrontPublicKey.attrId,
+        CLOUDFRONT_PRIVATE_KEY_SECRET_NAME: cloudfrontPrivateKeySecret.secretName,
+      },
+    });
+
+    // Grant Lambda permission to read favorites table and CloudFront private key
+    favoritesTable.grantReadData(getFavoritesFunction);
+    cloudfrontPrivateKeySecret.grantRead(getFavoritesFunction);
+
     // Photos end point - Cognito authentication
     const photos = api.root.addResource('photos');
     photos.addMethod('GET', new apigateway.LambdaIntegration(InventoryDescriber), {
@@ -301,13 +320,17 @@ export class AlbumShareStack extends Stack {
     // Grant Lambda permission to write to S3 bucket
     photoBucket.grantWrite(generateUploadUrlFunction);
 
-    // Favorites endpoint - POST to add, DELETE to remove
+    // Favorites endpoint - POST to add, DELETE to remove, GET to list by popularity
     const favorites = api.root.addResource('favorites');
     favorites.addMethod('POST', new apigateway.LambdaIntegration(manageFavoritesFunction), {
         authorizer: albumUserPoolAuthorizer,
         authorizationType: apigateway.AuthorizationType.COGNITO,
     });
     favorites.addMethod('DELETE', new apigateway.LambdaIntegration(manageFavoritesFunction), {
+        authorizer: albumUserPoolAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    favorites.addMethod('GET', new apigateway.LambdaIntegration(getFavoritesFunction), {
         authorizer: albumUserPoolAuthorizer,
         authorizationType: apigateway.AuthorizationType.COGNITO,
     });
@@ -374,6 +397,7 @@ export class AlbumShareStack extends Stack {
 
     // Add CloudFront domain to Lambda environment after distribution is created
     InventoryDescriber.addEnvironment('CLOUDFRONT_DOMAIN', photoDistribution.distributionDomainName);
+    getFavoritesFunction.addEnvironment('CLOUDFRONT_DOMAIN', photoDistribution.distributionDomainName);
 
 
 
