@@ -99,6 +99,14 @@ export class AlbumShareStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
     });
 
+    // GSI to support server-side tag filtering: find all photos tagged with a given tag
+    tagsTable.addGlobalSecondaryIndex({
+      indexName: 'tag-photoKey-index',
+      partitionKey: { name: 'tag', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'photoKey', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.KEYS_ONLY,
+    });
+
     // Lambda function that lists photos and signed URLs (environment set after CloudFront creation)
     const InventoryDescriber = new lambda.Function(this, 'InventoryDescriber', {
       functionName: "Album-Share-Inventory-Describer",
@@ -110,15 +118,17 @@ export class AlbumShareStack extends Stack {
       environment: {
         BUCKET_NAME: photoBucket.bucketName,
         FAVORITES_TABLE: favoritesTable.tableName,
+        TAGS_TABLE: tagsTable.tableName,
         CLOUDFRONT_KEY_PAIR_ID: cloudfrontPublicKey.attrId,
         CLOUDFRONT_PRIVATE_KEY_SECRET_NAME: cloudfrontPrivateKeySecret.secretName,
       },
     });
 
-    // Grant Lambda permission to read from S3 bucket and favorites table
+    // Grant Lambda permission to read from S3 bucket, favorites table, and tags table
     photoBucket.grantRead(InventoryDescriber);
     favoritesTable.grantReadData(InventoryDescriber);
-    
+    tagsTable.grantReadData(InventoryDescriber);
+
     // Grant Lambda permission to read the CloudFront private key from Secrets Manager
     cloudfrontPrivateKeySecret.grantRead(InventoryDescriber);
 

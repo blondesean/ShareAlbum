@@ -10,6 +10,8 @@ const secretsManager = new SecretsManagerClient({ region: "us-west-2" });
 
 const BUCKET = process.env.BUCKET_NAME;
 const FAVORITES_TABLE = process.env.FAVORITES_TABLE;
+const TAGS_TABLE = process.env.TAGS_TABLE;
+const TAGS_GSI = 'tag-photoKey-index';
 const CLOUDFRONT_DOMAIN = process.env.CLOUDFRONT_DOMAIN;
 const CLOUDFRONT_KEY_PAIR_ID = process.env.CLOUDFRONT_KEY_PAIR_ID;
 const CLOUDFRONT_PRIVATE_KEY_SECRET_NAME = process.env.CLOUDFRONT_PRIVATE_KEY_SECRET_NAME;
@@ -172,6 +174,48 @@ function generateRandomStartKey() {
   return strategies[0]();
 }
 
+/**
+ * Query the tag GSI to find all photoKeys that have been given a specific tag.
+ * Optionally restrict results to keys that start with s3Prefix (for year/month combo).
+ * Returns a deduplicated, sorted array of photoKeys.
+ */
+async function getPhotoKeysByTags(tags, s3Prefix) {
+  const photoKeySet = new Set();
+
+  for (const tag of tags) {
+    let lastEvaluatedKey = undefined;
+    do {
+      const result = await dynamodb.send(new QueryCommand({
+        TableName: TAGS_TABLE,
+        IndexName: TAGS_GSI,
+        KeyConditionExpression: 'tag = :tag',
+        ExpressionAttributeValues: {
+          ':tag': { S: tag }
+        },
+        ProjectionExpression: 'photoKey',
+        ExclusiveStartKey: lastEvaluatedKey,
+      }));
+      (result.Items || []).forEach(item => photoKeySet.add(item.photoKey.S));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+  }
+
+  let photoKeys = Array.from(photoKeySet);
+
+  // Apply year/month prefix filter if active
+  if (s3Prefix) {
+    photoKeys = photoKeys.filter(key => key.startsWith(s3Prefix));
+  }
+
+  // Exclude _a/_b variants (same rule as S3 path)
+  photoKeys = photoKeys.filter(key => {
+    const k = key.toLowerCase();
+    return !k.includes('_a.') && !k.includes('_b.');
+  });
+
+  return photoKeys.sort(); // Stable sort for consistent pagination
+}
+
 exports.handler = async (event) => {
   try {
     if (!BUCKET) {
@@ -185,30 +229,132 @@ exports.handler = async (event) => {
     const queryParams = event.queryStringParameters || {};
     const limit = Math.min(parseInt(queryParams.limit) || 25, 100); // Default 25, max 100
     const nextToken = queryParams.nextToken || null;
-    const tags = queryParams.tags ? queryParams.tags.split(',').map(t => t.trim()) : null; // Filter by tags
+    const year = queryParams.year ? queryParams.year.trim() : null;   // e.g. "1990"
+    const month = queryParams.month ? queryParams.month.trim() : null; // e.g. "January" — only meaningful when year is also set
+    const tags = queryParams.tags ? queryParams.tags.split(',').map(t => t.trim()).filter(Boolean) : null; // e.g. "birthday,family"
 
-    // Build S3 ListObjectsV2 command with pagination
+    // Build the S3 prefix from the active date filters.
+    // Folder naming convention: YYYY_Month/  (e.g. 1990_January/)
+    // - year + month  → exact folder prefix "1990_January"
+    // - year only     → year prefix "1990_" (matches all months in that year)
+    // - month only    → no usable prefix (month alone can't anchor a lexicographic prefix)
+    const s3Prefix = year && month ? `${year}_${month}` : year ? `${year}_` : null;
+
+    // Fetch this user's favorites and global favorite counts (needed by both tag and S3 paths)
+    let userFavorites = new Set();
+    let favoriteCounts = new Map();
+
+    if (userId && FAVORITES_TABLE) {
+      const userFavoritesResult = await dynamodb.send(new QueryCommand({
+        TableName: FAVORITES_TABLE,
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: {
+          ':userId': { S: userId }
+        }
+      }));
+      userFavorites = new Set(
+        (userFavoritesResult.Items || []).map(item => item.photoKey.S)
+      );
+
+      const allFavoritesResult = await dynamodb.send(new ScanCommand({
+        TableName: FAVORITES_TABLE,
+        ProjectionExpression: 'photoKey'
+      }));
+      (allFavoritesResult.Items || []).forEach(item => {
+        const photoKey = item.photoKey.S;
+        favoriteCounts.set(photoKey, (favoriteCounts.get(photoKey) || 0) + 1);
+      });
+    }
+
+    // Pre-fetch the private key once to avoid multiple Secrets Manager calls
+    if (CLOUDFRONT_DOMAIN && CLOUDFRONT_KEY_PAIR_ID) {
+      await getPrivateKey();
+    }
+
+    // ── TAG FILTER PATH ──────────────────────────────────────────────────────
+    // When tags are specified, bypass S3 listing entirely. Query the TagsTable
+    // GSI to get the set of photoKeys that carry those tags, then generate
+    // signed URLs for the paginated slice.
+    if (tags && tags.length > 0 && TAGS_TABLE) {
+      const tagOffset = nextToken
+        ? parseInt(Buffer.from(nextToken, 'base64').toString('utf-8'), 10) || 0
+        : 0;
+
+      const allPhotoKeys = await getPhotoKeysByTags(tags, s3Prefix);
+      const pageKeys = allPhotoKeys.slice(tagOffset, tagOffset + limit);
+      const hasMore = tagOffset + limit < allPhotoKeys.length;
+
+      const photos = await Promise.all(
+        pageKeys.map(async (photoKey) => {
+          try {
+            const url = await getCloudFrontSignedUrl(photoKey, 3600);
+            return {
+              key: photoKey,
+              url,
+              isFavorite: userFavorites.has(photoKey),
+              favoriteCount: favoriteCounts.get(photoKey) || 0,
+            };
+          } catch (error) {
+            console.error(`Error generating URL for tag result ${photoKey}:`, error);
+            return null;
+          }
+        })
+      );
+
+      const validPhotos = photos.filter(p => p !== null);
+
+      const response = {
+        photos: validPhotos,
+        pagination: { limit, count: validPhotos.length, hasMore },
+      };
+
+      if (hasMore) {
+        response.pagination.nextToken = Buffer.from(
+          String(tagOffset + limit)
+        ).toString('base64');
+      }
+
+      const origin = event.headers?.origin || event.headers?.Origin;
+      const allowedOrigins = ['http://localhost:5173', 'https://albumsharesdd.netlify.app'];
+      const corsOrigin = allowedOrigins.includes(origin) ? origin : 'http://localhost:5173';
+
+      return {
+        statusCode: 200,
+        headers: {
+          "Access-Control-Allow-Origin": corsOrigin,
+          "Access-Control-Allow-Headers": "Content-Type,Authorization",
+          "Access-Control-Allow-Methods": "GET,OPTIONS",
+          "Access-Control-Allow-Credentials": "false",
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          "Pragma": "no-cache",
+          "Expires": "0",
+        },
+        body: JSON.stringify(response),
+      };
+    }
+
+    // ── S3 LISTING PATH ──────────────────────────────────────────────────────
+    // Default path: list photos from S3, using year/month prefix or random start.
+
     const listParams = {
       Bucket: BUCKET,
       MaxKeys: limit,
     };
 
-    // Add continuation token if provided, otherwise use random starting point
     if (nextToken) {
       try {
-        // Decode the nextToken (base64 encoded S3 continuation token)
         listParams.ContinuationToken = Buffer.from(nextToken, 'base64').toString('utf-8');
       } catch (error) {
         throw new Error("Invalid nextToken provided");
       }
+      if (s3Prefix) {
+        listParams.Prefix = s3Prefix;
+      }
+    } else if (s3Prefix) {
+      listParams.Prefix = s3Prefix;
+      console.log(`DEBUG: Filtering by prefix: ${s3Prefix}`);
     } else {
-      // For the first page, start from a random point in the S3 bucket
-      // This provides true random discovery across the entire photo collection
-      
-      // Generate a random starting key to achieve uniform distribution
-      // S3 keys are lexicographically ordered, so we generate a random prefix
       const randomStartKey = generateRandomStartKey();
-      
       if (randomStartKey) {
         listParams.StartAfter = randomStartKey;
         console.log(`DEBUG: Starting after random key: ${randomStartKey}`);
@@ -222,19 +368,12 @@ exports.handler = async (event) => {
 
     // If we started from a random point but got very few results, try from the beginning
     let finalData = data;
-    if (!nextToken && listParams.StartAfter && (data.Contents || []).length < Math.min(limit / 2, 10)) {
+    if (!nextToken && !s3Prefix && listParams.StartAfter && (data.Contents || []).length < Math.min(limit / 2, 10)) {
       console.log(`DEBUG: Random start returned only ${(data.Contents || []).length} items, trying from beginning`);
-      
-      const fallbackParams = {
-        Bucket: BUCKET,
-        MaxKeys: limit,
-      };
-      
+
+      const fallbackParams = { Bucket: BUCKET, MaxKeys: limit };
       try {
-        const fallbackCommand = new ListObjectsV2Command(fallbackParams);
-        const fallbackData = await s3.send(fallbackCommand);
-        
-        // Use fallback data if it has more results
+        const fallbackData = await s3.send(new ListObjectsV2Command(fallbackParams));
         if ((fallbackData.Contents || []).length > (data.Contents || []).length) {
           finalData = fallbackData;
           console.log(`DEBUG: Using fallback data with ${(fallbackData.Contents || []).length} items`);
@@ -244,110 +383,50 @@ exports.handler = async (event) => {
       }
     }
 
-    // Get user's favorites and all favorite counts if authenticated
-    let userFavorites = new Set();
-    let favoriteCounts = new Map();
-    
-    if (userId && FAVORITES_TABLE) {
-      // Get current user's favorites
-      const userFavoritesResult = await dynamodb.send(new QueryCommand({
-        TableName: FAVORITES_TABLE,
-        KeyConditionExpression: 'userId = :userId',
-        ExpressionAttributeValues: {
-          ':userId': { S: userId }
-        }
-      }));
-      
-      userFavorites = new Set(
-        (userFavoritesResult.Items || []).map(item => item.photoKey.S)
-      );
-
-      // Get all favorites to count per photo (scan entire table)
-      const allFavoritesResult = await dynamodb.send(new ScanCommand({
-        TableName: FAVORITES_TABLE,
-        ProjectionExpression: 'photoKey'
-      }));
-
-      // Count favorites per photo
-      (allFavoritesResult.Items || []).forEach(item => {
-        const photoKey = item.photoKey.S;
-        favoriteCounts.set(photoKey, (favoriteCounts.get(photoKey) || 0) + 1);
-      });
-    }
-
-    // Pre-fetch the private key once to avoid multiple Secrets Manager calls
-    if (CLOUDFRONT_DOMAIN && CLOUDFRONT_KEY_PAIR_ID) {
-      await getPrivateKey(); // This will cache the key for all subsequent calls
-    }
-
-    // Filter for image files only - handle potential whitespace/special characters
-    // Also exclude _a.jpg and _b.jpg variants completely
     const imageObjects = (finalData.Contents || [])
       .filter(obj => {
         if (!obj.Key) return false;
         const key = obj.Key.trim().toLowerCase();
-        
-        // Check if it's an image file
         const isImage = key.endsWith(".jpg") || key.endsWith(".jpeg") || key.endsWith(".png") || key.endsWith(".gif") || key.endsWith(".webp");
         if (!isImage) return false;
-        
-        // Exclude _a.jpg and _b.jpg variants completely
-        if (key.includes('_a.') || key.includes('_b.')) {
-          return false;
-        }
-        
+        if (key.includes('_a.') || key.includes('_b.')) return false;
         return true;
       });
 
-    // Note: No need for complex duplicate filtering since we're excluding _a/_b variants entirely
-    const filteredPhotos = imageObjects;
-    
     console.log(`DEBUG: Filtered ${imageObjects.length} photos (excluded ${(finalData.Contents || []).length - imageObjects.length} non-images and _a/_b variants)`);
 
-    // Generate CloudFront signed URLs for each photo (secure, cached, cost-effective)
-    // URLs expire after 1 hour, ensuring only authenticated users can access photos
     const photos = await Promise.all(
-      filteredPhotos.map(async (obj) => {
-        let photoUrl;
-        
-        // Use CloudFront signed URLs if configured, otherwise fallback to error
-        if (CLOUDFRONT_DOMAIN && CLOUDFRONT_KEY_PAIR_ID) {
-          try {
-            photoUrl = await getCloudFrontSignedUrl(obj.Key, 3600); // 1 hour expiration
-          } catch (error) {
-            console.error(`Error generating CloudFront signed URL for ${obj.Key}:`, error);
-            // If CloudFront signing fails (e.g., private key not configured), throw error
-            throw new Error(`Failed to generate signed URL: ${error.message}`);
-          }
-        } else {
+      imageObjects.map(async (obj) => {
+        if (!CLOUDFRONT_DOMAIN || !CLOUDFRONT_KEY_PAIR_ID) {
           throw new Error("CloudFront configuration missing. Please configure CLOUDFRONT_DOMAIN and CLOUDFRONT_KEY_PAIR_ID.");
         }
-        
-        return {
-          key: obj.Key,
-          url: photoUrl,
-          isFavorite: userFavorites.has(obj.Key),
-          favoriteCount: favoriteCounts.get(obj.Key) || 0,
-          lastModified: obj.LastModified,
-          size: obj.Size,
-        };
+        try {
+          const photoUrl = await getCloudFrontSignedUrl(obj.Key, 3600);
+          return {
+            key: obj.Key,
+            url: photoUrl,
+            isFavorite: userFavorites.has(obj.Key),
+            favoriteCount: favoriteCounts.get(obj.Key) || 0,
+            lastModified: obj.LastModified,
+            size: obj.Size,
+          };
+        } catch (error) {
+          console.error(`Error generating CloudFront signed URL for ${obj.Key}:`, error);
+          throw new Error(`Failed to generate signed URL: ${error.message}`);
+        }
       })
     );
 
-    // For first page only: Add a few missing favorites (not all) that weren't in the random S3 results
+    // For first page only: inject a few of the user's favorites that weren't in the random S3 results
     if (!nextToken && userFavorites.size > 0) {
       const photosInResults = new Set(photos.map(p => p.key));
       const missingFavorites = Array.from(userFavorites).filter(fav => !photosInResults.has(fav));
-      
-      // Only add 2-3 missing favorites, not all of them, to leave room for random discovery
       const favoritesToAdd = Math.min(3, missingFavorites.length);
-      
-      // Generate URLs for a few missing favorites
+
       const missingFavoritePhotos = await Promise.all(
         missingFavorites.slice(0, favoritesToAdd).map(async (favoriteKey) => {
-          let photoUrl;
           try {
-            photoUrl = await getCloudFrontSignedUrl(favoriteKey, 3600);
+            const photoUrl = await getCloudFrontSignedUrl(favoriteKey, 3600);
             return {
               key: favoriteKey,
               url: photoUrl,
@@ -360,25 +439,16 @@ exports.handler = async (event) => {
           }
         })
       );
-      
-      // Add valid favorite photos to the beginning
-      const validMissingFavorites = missingFavoritePhotos.filter(p => p !== null);
-      photos.unshift(...validMissingFavorites);
-      
-      console.log(`DEBUG: Added ${validMissingFavorites.length} missing favorites out of ${missingFavorites.length} total missing`);
+
+      photos.unshift(...missingFavoritePhotos.filter(p => p !== null));
     }
 
-    // Sort photos: favorites first, then random order for discovery
     photos.sort((a, b) => {
-      // If one is favorite and other isn't, favorite comes first
       if (a.isFavorite && !b.isFavorite) return -1;
       if (!a.isFavorite && b.isFavorite) return 1;
-      
-      // If both are favorites or both are not favorites, randomize
       return Math.random() - 0.5;
     });
 
-    // For the first page, trim to requested limit after sorting (favorites first, then random)
     const finalPhotos = nextToken ? photos : photos.slice(0, limit);
 
     console.log(`DEBUG: Final photos sample:`, finalPhotos.slice(0, 3).map(p => ({ key: p.key, isFavorite: p.isFavorite })));

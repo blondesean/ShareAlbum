@@ -1,4 +1,4 @@
-const { DynamoDBClient, ScanCommand } = require("@aws-sdk/client-dynamodb");
+const { DynamoDBClient, ScanCommand, QueryCommand } = require("@aws-sdk/client-dynamodb");
 const { SecretsManagerClient, GetSecretValueCommand } = require("@aws-sdk/client-secrets-manager");
 const { getSignedUrl } = require("@aws-sdk/cloudfront-signer");
 
@@ -65,6 +65,19 @@ exports.handler = async (event) => {
     const queryParams = event.queryStringParameters || {};
     const limit = Math.min(parseInt(queryParams.limit) || 50, 100); // Default 50, max 100
 
+    // Get current user's own favorites (for per-user isFavorite flag)
+    const userFavoritesResult = await dynamodb.send(new QueryCommand({
+      TableName: FAVORITES_TABLE,
+      KeyConditionExpression: 'userId = :userId',
+      ExpressionAttributeValues: {
+        ':userId': { S: userId }
+      },
+      ProjectionExpression: 'photoKey'
+    }));
+    const userFavoriteSet = new Set(
+      (userFavoritesResult.Items || []).map(item => item.photoKey.S)
+    );
+
     // Get all favorites with counts
     const allFavoritesResult = await dynamodb.send(new ScanCommand({
       TableName: FAVORITES_TABLE,
@@ -97,7 +110,7 @@ exports.handler = async (event) => {
             key: photoKey,
             url: url,
             favoriteCount: count,
-            isFavorite: true
+            isFavorite: userFavoriteSet.has(photoKey)
           };
         } catch (error) {
           console.error(`Error generating URL for favorite ${photoKey}:`, error);
